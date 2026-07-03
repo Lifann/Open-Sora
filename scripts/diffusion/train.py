@@ -13,6 +13,7 @@ gc.disable()
 
 
 import torch
+import torch_mlu.utils.gpu_migration  # MLU: 透明迁移 torch.cuda.* -> torch.mlu.*
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
@@ -480,7 +481,8 @@ def main():
 
         with nsys.range("optim"), timers["optim"]:
             if (step + 1) % accumulation_steps == 0:
-                booster.checkpoint_io.synchronize()
+                if hasattr(booster.checkpoint_io, 'synchronize'):
+                    booster.checkpoint_io.synchronize()
                 optimizer.step()
                 optimizer.zero_grad()
             if lr_scheduler is not None:
@@ -564,7 +566,7 @@ def main():
                             pbar.set_postfix(
                                 {
                                     "loss": avg_loss,
-                                    "global_grad_norm": optimizer.get_grad_norm(),
+                                    "global_grad_norm": (optimizer.get_grad_norm() if hasattr(optimizer, "get_grad_norm") else None),
                                     "step": step,
                                     "global_step": global_step,
                                     # "actual_update_step": actual_update_step,
@@ -584,7 +586,7 @@ def main():
                                     "avg_loss": avg_loss,
                                     "lr": optimizer.param_groups[0]["lr"],
                                     "eps": optimizer.param_groups[0]["eps"],
-                                    "global_grad_norm": optimizer.get_grad_norm(),  # test grad norm
+                                    "global_grad_norm": (optimizer.get_grad_norm() if hasattr(optimizer, "get_grad_norm") else None),  # test grad norm
                                 }
                                 if cfg.get("record_time", False):
                                     wandb_dict.update(timers.to_dict())

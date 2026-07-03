@@ -12,11 +12,19 @@ import torch.distributed as dist
 import torch.nn as nn
 from colossalai.booster import Booster
 from colossalai.checkpoint_io import GeneralCheckpointIO
-from colossalai.utils.safetensors import save as async_save
+try:
+    from colossalai.utils.safetensors import save as async_save
+except ModuleNotFoundError:
+    import torch
+    def async_save(path, state_dict, use_async=None):
+        torch.save(state_dict, path)
 from colossalai.zero.low_level import LowLevelZeroOptimizer
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
-from tensornvme.async_file_io import AsyncFileWriter
+try:
+    from tensornvme.async_file_io import AsyncFileWriter
+except ModuleNotFoundError:
+    AsyncFileWriter = object  # MLU: tensornvme 不可用，仅作类型标注
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 

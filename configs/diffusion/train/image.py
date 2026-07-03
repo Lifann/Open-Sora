@@ -7,6 +7,11 @@ dataset = dict(
 )
 
 grad_ckpt_settings = (8, 100)  # set the grad checkpoint settings
+# 激活值 offload 到 CPU 的 buffer 大小。设为 >0 时 train.py 会启用
+# GLOBAL_ACTIVATION_MANAGER.setup_buffer(...)，把梯度检查点的激活值搬到 CPU，
+# 大幅降低单卡 MLU 显存峰值（MLU590 80GiB 卡上 256px/50 帧训练不开会 OOM）。
+# 机器有 2TB 主机内存，25GiB 绰绰有余。
+grad_ckpt_buffer_size = 25 * 1024**3
 bucket_config = {
     "256px": {1: (1.0, 50)},
     "768px": {1: (0.5, 11)},

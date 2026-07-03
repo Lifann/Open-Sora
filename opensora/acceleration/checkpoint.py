@@ -19,8 +19,12 @@ class ActivationManager:
         self.enable = False
         self.buffer = None
         self.total_size = 0
-        self.avail_offset = 0
-        self.tensor_id_queue = []
+        # 用 dict 按 id 跟踪当前 offload 到 CPU 的张量及其 numel（而非 LIFO 栈）。
+        # MLU：原版按 LIFO 顺序做 onload，当共享输入 vec/pe 在所有 block 间复用、
+        # 且双流/单流 block 交替 checkpoint 时，vec 可能被 offload 后不再处于栈顶，
+        # 于是永远不会被 onload 回 MLU，最终以 CPU 张量进入线性层触发
+        # `mat1 is on cpu`。改为按 id 任意顺序 onload，彻底消除顺序依赖。
+        self.offloaded = {}
         self.ignore_tensor_id_set = set()
 
     def setup_buffer(self, numel: int, dtype: torch.dtype):
@@ -28,36 +32,45 @@ class ActivationManager:
         self.total_size = numel
         self.enable = True
 
+    def used_size(self) -> int:
+        return sum(self.offloaded.values())
+
     def offload(self, x: torch.Tensor) -> None:
         if not self.enable or id(x) in self.ignore_tensor_id_set:
             return
         size = x.numel()
-        if self.avail_offset + size > self.total_size:
+        if self.used_size() + size > self.total_size:
             raise RuntimeError("Activation buffer is full")
-        assert x.dtype == self.buffer.dtype, f"Wrong dtype of offload tensor"
-        cpu_x = self.buffer[self.avail_offset : self.avail_offset + size].view_as(x)
+        # MLU: bf16 训练下部分激活（如 pe/rope 嵌入）为 fp32，与 bf16 buffer 不一致。
+        # 统一 cast 到 buffer.dtype 再 offload；bf16 训练下精度损失可忽略。
+        if x.dtype != self.buffer.dtype:
+            x = x.to(self.buffer.dtype)
+        off = self.used_size()
+        cpu_x = self.buffer[off : off + size].view_as(x)
         cpu_x.copy_(x)
         x.data = cpu_x
-        self.avail_offset += size
-        self.tensor_id_queue.append(id(x))
+        self.offloaded[id(x)] = size
 
     def onload(self, x: torch.Tensor) -> None:
-        if not self.enable or id(x) in self.ignore_tensor_id_set:
+        if not self.enable:
             return
-        assert self.tensor_id_queue[-1] == id(x), f"Wrong order of offload/onload"
+        tid = id(x)
+        if tid not in self.offloaded:
+            return
+        del self.offloaded[tid]
         # current x is pinned memory
         assert x.data.is_pinned()
-        x.data = x.data.to(get_current_device(), non_blocking=True)
-        self.tensor_id_queue.pop()
-        self.avail_offset -= x.numel()
-        if len(self.tensor_id_queue) == 0:
+        x.data = x.data.to(get_current_device())
+        if not self.offloaded:
             self.ignore_tensor_id_set.clear()
 
     def add_ignore_tensor(self, x: torch.Tensor) -> None:
         self.ignore_tensor_id_set.add(id(x))
 
-    def is_top_tensor(self, x: torch.Tensor) -> bool:
-        return len(self.tensor_id_queue) > 0 and self.tensor_id_queue[-1] == id(x)
+    def reset(self) -> None:
+        """MLU: 每个训练 step 的 forward 起点清空 offload 状态。"""
+        self.offloaded.clear()
+        self.ignore_tensor_id_set.clear()
 
 
 GLOBAL_ACTIVATION_MANAGER = ActivationManager()
@@ -66,21 +79,25 @@ GLOBAL_ACTIVATION_MANAGER = ActivationManager()
 class CheckpointFunctionWithOffload(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
-        for x in args[::-1]:
-            # handle those tensors are used in multiple checkpoints
-            if GLOBAL_ACTIVATION_MANAGER.is_top_tensor(x):
+        # MLU: 每个 arg 只要当前被 offload 到 CPU，就无条件 onload 回 MLU。
+        # 不依赖 LIFO 栈顺序，因此共享输入 vec/pe 在任意 block 都保证在设备上。
+        for x in args:
+            if torch.is_tensor(x):
                 GLOBAL_ACTIVATION_MANAGER.onload(x)
-                GLOBAL_ACTIVATION_MANAGER.add_ignore_tensor(x)
         out = CheckpointFunction.forward(ctx, run_function, preserve_rng_state, *args)
         for x in args:
             if torch.is_tensor(x):
                 GLOBAL_ACTIVATION_MANAGER.offload(x)
+        # 被 onload 回来的共享输入（vec/pe）不再重复 offload，避免跨 block 的 CPU 残留。
+        for x in args:
+            if torch.is_tensor(x) and id(x) not in GLOBAL_ACTIVATION_MANAGER.offloaded:
+                GLOBAL_ACTIVATION_MANAGER.add_ignore_tensor(x)
         return out
 
     @staticmethod
     def backward(ctx, *args):
-        # with stack-fashion, the last tensor is the first to be loaded
-        for tensor in ctx.saved_tensors[::-1]:
+        # onload 对「未被 offload 的 tensor」是 no-op，安全。
+        for tensor in ctx.saved_tensors:
             GLOBAL_ACTIVATION_MANAGER.onload(tensor)
         return CheckpointFunction.backward(ctx, *args)
 

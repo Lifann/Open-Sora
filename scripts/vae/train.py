@@ -13,6 +13,7 @@ gc.disable()
 
 
 import torch
+import torch_mlu.utils.gpu_migration  # MLU: 透明迁移 torch.cuda.* -> torch.mlu.*
 import torch.distributed as dist
 from colossalai.booster import Booster
 from colossalai.utils import set_seed

@@ -22,7 +22,10 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from opensora.acceleration.checkpoint import auto_grad_checkpoint
+from opensora.acceleration.checkpoint import (
+    GLOBAL_ACTIVATION_MANAGER,
+    auto_grad_checkpoint,
+)
 from opensora.models.mmdit.layers import (
     DoubleStreamBlock,
     EmbedND,
@@ -221,6 +224,17 @@ class MMDiTModel(nn.Module):
             img, img_ids, txt, txt_ids, timesteps, y_vec, cond, guidance
         )
 
+        # MLU: 每个 forward 起点重置激活 offload 栈，避免上一步残留的脏队列
+        # 导致共享输入（vec/pe）offload 后无法被 onload 回 MLU（mat1 on cpu 报错）。
+        GLOBAL_ACTIVATION_MANAGER.reset()
+
+        # MLU: vec/pe 是所有 block 共用的「输入常量」（不是 block 内部产生的大激活），
+        # 被 offload 后，紧接着的【非 checkpointed block】会直接以 CPU 张量消费它而崩溃。
+        # 因此把它标记为「永不 offload」：offload 会跳过它们，且先 onload 一次以防跨 step 残留。
+        for _t in (vec, pe):
+            GLOBAL_ACTIVATION_MANAGER.onload(_t)
+            GLOBAL_ACTIVATION_MANAGER.add_ignore_tensor(_t)
+
         for block in self.double_blocks:
             img, txt = auto_grad_checkpoint(block, img, txt, vec, pe)
 
@@ -247,6 +261,15 @@ class MMDiTModel(nn.Module):
         img, txt, vec, pe = self.prepare_block_inputs(
             img, img_ids, txt, txt_ids, timesteps, y_vec, cond, guidance
         )
+
+        # MLU: 每个 forward 起点重置激活 offload 栈（同 forward_ckpt 的说明）。
+        GLOBAL_ACTIVATION_MANAGER.reset()
+
+        # MLU: vec/pe 标记「永不 offload」（同 forward_ckpt 的说明），
+        # 否则非 checkpointed 的 double/single block 会以 CPU 上的 vec/pe 进入线性层。
+        for _t in (vec, pe):
+            GLOBAL_ACTIVATION_MANAGER.onload(_t)
+            GLOBAL_ACTIVATION_MANAGER.add_ignore_tensor(_t)
 
         ckpt_depth_double = self.config.grad_ckpt_settings[0]
         for block in self.double_blocks[:ckpt_depth_double]:

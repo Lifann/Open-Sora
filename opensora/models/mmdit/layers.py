@@ -113,14 +113,11 @@ class RMSNorm(torch.nn.Module):
 
 class FusedRMSNorm(RMSNorm):
     def forward(self, x: Tensor):
-        return LigerRMSNormFunction.apply(
-            x,
-            self.scale,
-            1e-6,
-            0.0,
-            "llama",
-            False,
-        )
+        # MLU: liger_kernel 的 Triton 算子无法在 MLU 上 launch，退化为原生 RMSNorm（功能等价）
+        x_dtype = x.dtype
+        x = x.float()
+        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        return (x * rrms).to(dtype=x_dtype) * self.scale
 
 
 class QKNorm(torch.nn.Module):

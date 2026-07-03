@@ -85,6 +85,7 @@ class _MultiProcessingDataLoaderIterForVideo(_MultiProcessingDataLoaderIter):
 
     def __init__(self, loader):
         _BaseDataLoaderIter.__init__(self, loader)
+        self._in_order = getattr(loader, "in_order", True)  # MLU/torch2.10: dataloader 兼容
         self.pin_memory_cache = PinMemoryCache()
 
         self._prefetch_factor = loader.prefetch_factor

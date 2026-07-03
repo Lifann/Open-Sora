@@ -1,7 +1,32 @@
 import torch
 from colossalai.nn.lr_scheduler import CosineAnnealingWarmupLR
 from colossalai.nn.optimizer import HybridAdam
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import _LRScheduler
+
+
+def _build_hybrid_adam(params, **kw):
+    """尝试构造 ColossalAI 的 HybridAdam。
+
+    HybridAdam 内部会加载一个 CUDA 扩展（CPUAdamLoader），在无 CUDA 的
+    环境（如寒武纪 MLU 590）下会因找不到 CUDA_HOME 而抛 AssertionError。
+    此时回退到纯 PyTorch 的 AdamW（Open-Sora 配置里 adamw_mode=True，
+    即 HybridAdam 退化为 AdamW 语义，行为一致）。
+
+    注意：params 必须由调用方传 list（而非 generator），否则 HybridAdam
+    构造失败时可能已耗尽该迭代器，导致回退的 AdamW 拿到空参数列表而报错。
+    """
+    try:
+        return HybridAdam(params, **kw)
+    except Exception as e:  # CUDA_HOME missing / 扩展加载失败
+        import logging
+
+        logging.getLogger("opensora").warning(
+            "[optimizer] HybridAdam 不可用（%s），回退到 torch.optim.AdamW", e
+        )
+        # HybridAdam 专属字段对 AdamW 无效，逐字段剥离后安全传递
+        kw.pop("adamw_mode", None)
+        return AdamW(params, **kw)
 
 
 def create_optimizer(
@@ -19,14 +44,13 @@ def create_optimizer(
         torch.optim.Optimizer: The optimizer.
     """
     optimizer_name = optimizer_config.pop("cls", "HybridAdam")
+    # 物化为 list：params 可能要传给两次构造（HybridAdam 失败回退 AdamW），
+    # generator 只能消费一次，必须固化成 list。
+    params = list(filter(lambda p: p.requires_grad, model.parameters()))
     if optimizer_name == "HybridAdam":
-        optimizer_cls = HybridAdam
+        optimizer = _build_hybrid_adam(params, **optimizer_config)
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
-    optimizer = optimizer_cls(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        **optimizer_config,
-    )
     return optimizer
 
 
