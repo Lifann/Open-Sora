@@ -13,7 +13,8 @@ gc.disable()
 
 
 import torch
-import torch_mlu.utils.gpu_migration  # MLU: 透明迁移 torch.cuda.* -> torch.mlu.*
+if os.environ.get("OPENSORA_DEVICE_BACKEND", "cuda").lower() in {"mlu", "cambricon"}:
+    import torch_mlu.utils.gpu_migration  # MLU: 透明迁移 torch.cuda.* -> torch.mlu.*
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
