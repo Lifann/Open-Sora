@@ -56,12 +56,16 @@ def _pin_memory_loop(
         idx, data = r
         if not done_event.is_set() and not isinstance(data, ExceptionWrapper):
             try:
-                assert isinstance(data, dict)
-                if pin_memory_key in data:
-                    val = data[pin_memory_key]
-                    pin_memory_value = pin_memory_cache.get(val)
-                    pin_memory_value.copy_(val)
-                    data[pin_memory_key] = pin_memory_value
+                # collate_fn_default returns None when all samples in a micro-batch
+                # failed to load (missing/corrupt media). Pass it through so the
+                # training loop can synchronize-skip that step across ranks.
+                if data is not None:
+                    assert isinstance(data, dict)
+                    if pin_memory_key in data:
+                        val = data[pin_memory_key]
+                        pin_memory_value = pin_memory_cache.get(val)
+                        pin_memory_value.copy_(val)
+                        data[pin_memory_key] = pin_memory_value
             except Exception:
                 data = ExceptionWrapper(where=f"in pin memory thread for device {device_id}")
             r = (idx, data)
@@ -317,9 +321,12 @@ def prepare_dataloader(
 
 
 def collate_fn_default(batch):
-    # filter out None
+    # filter out None (samples that failed to load, e.g. missing/corrupt media).
+    # If the whole micro-batch is empty, return None and let the training loop
+    # synchronize-skip the step across ranks instead of crashing in a worker.
     batch = [x for x in batch if x is not None]
-    assert len(batch) > 0, "batch is empty"
+    if len(batch) == 0:
+        return None
 
     # HACK: for loading text features
     use_mask = False

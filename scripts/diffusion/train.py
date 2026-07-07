@@ -525,11 +525,14 @@ def main():
             def fetch_data():
                 step, batch = next(pbar_iter)
                 # print(f"==debug== rank{dist.get_rank()} {dataloader_iter.get_cache_info()}")
+                if batch is None:
+                    return None, step, None
                 pinned_video = batch["video"]
                 batch["video"] = pinned_video.to(device, dtype, non_blocking=True)
                 return batch, step, pinned_video
 
             batch_, step_, pinned_video_ = fetch_data()
+            skipped_empty_batches = 0
 
             for _ in range(start_step, num_steps_per_epoch):
                 nsys.step()
@@ -540,6 +543,24 @@ def main():
                     if step + 1 < num_steps_per_epoch:
                         # only fetch new data if not last step
                         batch_, step_, pinned_video_ = fetch_data()
+
+                # If any rank gets an empty micro-batch (all samples failed to load),
+                # all ranks skip this iteration together. This avoids desynchronizing
+                # distributed collectives while tolerating missing/corrupt media.
+                local_has_batch = torch.tensor(1 if batch is not None else 0, device=device)
+                dist.all_reduce(local_has_batch, op=dist.ReduceOp.MIN)
+                if local_has_batch.item() == 0:
+                    skipped_empty_batches += 1
+                    if is_log_process(plugin_type, plugin_config):
+                        logger.warning(
+                            "Skipping step %s because at least one rank got an empty batch "
+                            "after filtering failed media samples (skipped=%s).",
+                            step,
+                            skipped_empty_batches,
+                        )
+                    if cache_pin_memory and pinned_video is not None:
+                        dataloader_iter.remove_cache(pinned_video)
+                    continue
 
                 # == run iter ==
                 with nsys.range("iter"), timers["iter"]:
