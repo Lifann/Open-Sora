@@ -1,3 +1,4 @@
+import os
 from collections import OrderedDict, defaultdict
 from typing import Iterator
 
@@ -223,15 +224,35 @@ class VariableVideoBatchSampler(DistributedSampler):
         bucket_ids = None
         if dist.get_rank() == 0:
             data = self.dataset.data.copy(deep=True)
+            bucket_ids = np.empty(len(data), dtype=object)
+            bucket_ids[:] = None
+
+            # Filter missing files before bucket assignment so the batch sampler only
+            # forms micro-batches from samples that exist on the mounted filesystem.
+            # Runtime dataset-level filtering remains as a fallback for corrupt media
+            # or decode failures that cannot be detected by os.path.exists().
+            exists_mask = data["path"].map(lambda p: isinstance(p, str) and os.path.exists(p))
+            missing_count = int((~exists_mask).sum())
+            if missing_count > 0:
+                examples = data.loc[~exists_mask, "path"].head(5).tolist()
+                log_message(
+                    "Filtered %s samples with missing media paths before bucket batching. Examples: %s",
+                    missing_count,
+                    examples,
+                )
+            data = data.loc[exists_mask].copy()
             data["id"] = data.index
-            bucket_ids = data.parallel_apply(
-                apply,
-                axis=1,
-                method=self.bucket.get_bucket_id,
-                seed=self.seed + self.epoch,
-                num_bucket=self.bucket.num_bucket,
-                fps_max=self.dataset.fps_max,
-            )
+            if len(data) > 0:
+                valid_bucket_ids = data.parallel_apply(
+                    apply,
+                    axis=1,
+                    method=self.bucket.get_bucket_id,
+                    seed=self.seed + self.epoch,
+                    num_bucket=self.bucket.num_bucket,
+                    fps_max=self.dataset.fps_max,
+                )
+                for idx, bucket_id in valid_bucket_ids.items():
+                    bucket_ids[idx] = bucket_id
         dist.barrier()
         bucket_ids = sync_object_across_devices(bucket_ids)
         dist.barrier()
